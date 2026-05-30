@@ -131,7 +131,9 @@ def simulate(state: SimState, moves: Dict[str, Direction], deltas) -> SimState:
     new_heads: Dict[str, Coord] = {}
     for name, snake in nxt.snakes.items():
         if not snake.alive:
+            new_heads[name] = snake.head
             continue
+
         d = moves.get(name)
         if d is None:
             # Keep going straight if we have no instruction for this snake.
@@ -158,9 +160,8 @@ def simulate(state: SimState, moves: Dict[str, Direction], deltas) -> SimState:
     occupied: Dict[Coord, int] = {}
     bodies: Dict[str, List[Coord]] = {}
     for name, snake in nxt.snakes.items():
-        if not snake.alive:
-            continue
         bodies[name] = snake.body
+
         for cell in snake.body:
             occupied[cell] = occupied.get(cell, 0) + 1
 
@@ -243,8 +244,7 @@ def evaluate(state: SimState, depth_left: int) -> float:
     # 0, silently disabling this whole term).
     blocked = set()
     for s in state.snakes.values():
-        if s.alive:
-            blocked.update(s.body)
+        blocked.update(s.body)
     blocked.discard(me.head)
 
     # One BFS gives both the reachable space (anti-trap) and the true
@@ -482,7 +482,7 @@ def render_board(state: SimState) -> str:
         grid[a[1] % h][a[0] % w] = "*"
     letter = ord("A")
     for name, s in state.snakes.items():
-        if not s.alive or not s.body:
+        if not s.body:
             continue
         if name == state.me:
             body_ch, head_ch = "o", "@"

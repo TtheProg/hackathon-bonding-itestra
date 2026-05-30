@@ -92,4 +92,4 @@ class Field:
 
     def hazards(self) -> List[Coord]:
         """Non-apple items we'd rather not eat (e.g. BadApple)."""
-        return [it.pos for it in self.items if it.kind != "Apple"]
+        return [it.pos for it in self.items if it.kind == "BadApple"]
