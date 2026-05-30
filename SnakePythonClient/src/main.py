@@ -297,7 +297,7 @@ def run(api: SnakeFieldAPI, team: str, opp_k: int, auto_reset: bool) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Ouroboros snake bot")
     parser.add_argument("--team_name", default="Ouroboros", help="Team/snake name")
-    parser.add_argument("--game_name", default="Ouroboros", help="Game to join")
+    parser.add_argument("--game_name", default="diamond-Ouroboros", help="Game to join")
     parser.add_argument("--password", default="hermeticism", help="Server password")
     parser.add_argument(
         "--base_url", default="http://192.168.7.211:3030", help="Game server base URL"

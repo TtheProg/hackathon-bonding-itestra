@@ -89,7 +89,10 @@ class Field:
 
     def apples(self) -> List[Coord]:
         return [it.pos for it in self.items if it.kind == "Apple"]
+    
+    def badapples(self) -> List[Coord]:
+        return [it.pos for it in self.items if it.kind == "BadApple"]
 
     def hazards(self) -> List[Coord]:
         """Non-apple items we'd rather not eat (e.g. BadApple)."""
-        return [it.pos for it in self.items if it.kind == "BadApple"]
+        return [it.pos for it in self.items if it.kind == "Hazard"]

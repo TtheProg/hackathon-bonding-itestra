@@ -65,6 +65,7 @@ class SimState:
     size: Tuple[int, int]
     snakes: Dict[str, SimSnake]
     apples: set
+    bad_apples: set
     me: str
 
     def clone(self) -> "SimState":
@@ -72,6 +73,7 @@ class SimState:
             size=self.size,
             snakes={n: s.clone() for n, s in self.snakes.items()},
             apples=set(self.apples),
+            bad_apples=set(self.bad_apples),
             me=self.me,
         )
 
@@ -152,9 +154,26 @@ def simulate(state: SimState, moves: Dict[str, Direction], deltas) -> SimState:
             continue
         head = new_heads[name]
         grew = head in nxt.apples
-        snake.body = [head] + snake.body if grew else [head] + snake.body[:-1]
+        shrunk = head in nxt.bad_apples
+
+        if grew:
+            snake.body = [head] + snake.body
+
+        elif shrunk:
+            # remove one extra segment
+            if len(snake.body) > 1:
+                snake.body = [head] + snake.body[:-2]
+            else:
+                snake.alive = False
+
+        else:
+            snake.body = [head] + snake.body[:-1]
+
         if grew:
             nxt.apples.discard(head)
+
+        if shrunk:
+            nxt.bad_apples.discard(head)
 
     # Resolve collisions against post-move bodies, all at once.
     occupied: Dict[Coord, int] = {}
@@ -268,6 +287,17 @@ def evaluate(state: SimState, depth_left: int) -> float:
             # weaker straight-line pull plus a penalty for being walled off.
             nearest = min(torus_dist(me.head, a, size) for a in state.apples)
             score -= nearest * 30.0 + 80.0
+
+    
+    if state.bad_apples:
+        # Avoid bad apples.
+        for bad in state.bad_apples:
+            d = torus_dist(me.head, bad, size)
+
+            if d == 0:
+                score -= 1500
+            else:
+                score -= 100.0 / d
 
     # Mild bonus for outliving opponents.
     opponents_alive = sum(
@@ -399,11 +429,12 @@ def choose_direction(state: SimState, deadline: float, deltas,
                          key=lambda a: (torus_dist(me.head, a, state.size),
                                         a[0], a[1]))
 
-    def order_key(d: Direction):
+    def order_key(d):
         nh = step(me.head, d, deltas, state.size)
+        bad_penalty = 1 if nh in state.bad_apples else 0
         to_target = torus_dist(nh, target, state.size) if target else 0
         straight_pref = 0 if (heading and deltas[d] == heading) else 1
-        return (to_target, straight_pref)
+        return (bad_penalty, to_target, straight_pref)
 
     moves.sort(key=order_key)
 
@@ -480,6 +511,8 @@ def render_board(state: SimState) -> str:
     grid = [["." for _ in range(w)] for _ in range(h)]
     for a in state.apples:
         grid[a[1] % h][a[0] % w] = "*"
+    for a in state.bad_apples:
+        grid[a[1] % h][a[0] % w] = "!"
     letter = ord("A")
     for name, s in state.snakes.items():
         if not s.body:
@@ -509,5 +542,6 @@ def state_from_field(field_obj, me: str) -> Optional[SimState]:
         size=tuple(field_obj.size),
         snakes=snakes,
         apples=set(field_obj.apples()),
+        bad_apples=set(field_obj.badapples()),
         me=me,
     )
