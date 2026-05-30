@@ -284,6 +284,22 @@ def bfs_field(start: Coord, blocked: set, size: Tuple[int, int],
     return count, nearest, nearest_dist
 
 
+# --------------------------------------------------------------------------- #
+# Heuristic weights (tunable). DOCTRINE: outlive the opponents. Survival (space,
+# not getting trapped, killing rivals) dominates; growth is barely rewarded.
+# --------------------------------------------------------------------------- #
+W_LENGTH = 50.0           # length is no longer the goal -- just a faint nudge
+W_SPACE = 40.0            # staying in open space is now a primary objective
+W_TRAP = 500.0            # being boxed in (reachable space < our length) is dire
+W_APPLE = 5.0             # only a whisper of a pull toward food
+W_BADAPPLE_ON = 300.0     # stepping onto a hazard, de-emphasised
+W_BADAPPLE_NEAR = 20.0    # proximity repulsion from hazards, de-emphasised
+W_OPP_ALIVE = 500.0       # each living opponent is a heavy standing penalty
+W_H2H = 150.0             # BONUS for pressuring an enemy head (was a penalty)
+DEATH_BASE = 1e9          # dying is catastrophic; scaled exponentially by how
+                          # soon it happens (see evaluate()).
+
+
 def evaluate(state: SimState, depth_left: int) -> float:
     """Score the position from our point of view. Higher is better."""
     me = state.snakes[state.me]
@@ -291,9 +307,10 @@ def evaluate(state: SimState, depth_left: int) -> float:
     cells = size[0] * size[1]
 
     if not me.alive:
-        # Dying is terrible; dying sooner is worse than dying later, so reward
-        # the extra plies survived (depth_left is high near the root).
-        return -1e9 - depth_left * 1e6
+        # Dying ends our run. Catastrophic -- and dying *sooner* (more plies left
+        # in the search => closer to the present) is *exponentially* worse, so we
+        # claw for every extra tick of survival rather than trading them cheaply.
+        return -DEATH_BASE * (2.0 ** depth_left)
 
     # Free space reachable from our head = anti-trap signal. Block every snake
     # body, but NOT our own head cell (that's where we measure *from* -- leaving
@@ -312,45 +329,43 @@ def evaluate(state: SimState, depth_left: int) -> float:
     space_cap = min(cells, max(2 * me.length, 32))
     space = flood_fill(me.head, blocked, size, space_cap)
     score = 0.0
-    score += me.length * 1000.0          # length is the literal scoreboard
-    score += space * 10.0                # don't get boxed in
+    score += me.length * W_LENGTH        # growth is a nudge, not the goal
+    score += space * W_SPACE             # keep room to manoeuvre
     # If we can't even reach as many cells as our own length, we're trapped.
     if space < me.length:
-        score -= (me.length - space) * 200.0
+        score -= (me.length - space) * W_TRAP
 
     # Seek apples by cheap torus (x/y) distance -- a linear scan over the apple
-    # set, no per-leaf obstacle-aware BFS. choose_direction() already commits the
-    # root move toward a *path-reachable* apple each tick, and trap-avoidance is
-    # the flood-fill term's job, so a wall-ignoring gradient is enough here and
-    # far faster. Weighted to beat coasting straight but stay below the +1000 of
-    # actually eating (via the length term once the head reaches the apple).
+    # set, no per-leaf obstacle-aware BFS. Only a faint pull now: eating grows us
+    # (less room, more trap risk), which our survival doctrine mostly dislikes.
     if state.apples:
         nearest = min(torus_dist(me.head, a, size) for a in state.apples)
-        score -= nearest * 30.0
-
+        score -= nearest * W_APPLE
 
     if state.bad_apples:
         # Avoid bad apples.
         for bad in state.bad_apples:
             d = torus_dist(me.head, bad, size)
-
             if d == 0:
-                score -= 1500
+                score -= W_BADAPPLE_ON
             else:
-                score -= 100.0 / d
+                score -= W_BADAPPLE_NEAR / d
 
-    # Mild bonus for outliving opponents.
+    # Outlive the field: every living opponent is a big standing penalty, so any
+    # line where a rival is forced to die is strongly preferred.
     opponents_alive = sum(
         1 for n, s in state.snakes.items() if n != state.me and s.alive
     )
-    score -= opponents_alive * 50.0
+    score -= opponents_alive * W_OPP_ALIVE
 
-    # Avoid sitting adjacent to a longer/equal enemy head (head-to-head risk).
+    # Aggression: reward sitting next to a living enemy head (pressure / kill
+    # threat). Actually moving INTO a head is still our own death (handled above,
+    # and it dominates), so this rewards adjacency only -- never suicide.
     for n, s in state.snakes.items():
         if n == state.me or not s.alive:
             continue
-        if torus_dist(me.head, s.head, size) == 1 and s.length >= me.length:
-            score -= 120.0
+        if torus_dist(me.head, s.head, size) == 1:
+            score += W_H2H
 
     return score
 
