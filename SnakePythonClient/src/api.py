@@ -48,18 +48,20 @@ class SnakeFieldAPI:
     def _url(self, path: str) -> str:
         return f"{self.base_url}{path}"
 
-    def get_field(self) -> Field:
+    def get_field(self, timeout: Optional[float] = None) -> Field:
         url = self._url(f"/games/{self.game_name}/state")
-        resp = self.session.get(url, timeout=self.timeout)
+        resp = self.session.get(url, timeout=timeout or self.timeout)
         if resp.status_code != 200:
             raise ApiError(resp.status_code, resp.text)
         raw = resp.json()
         self.last_raw = raw
         return Field.from_dict(raw)
 
-    def set_direction(self, direction: Direction) -> int:
+    def set_direction(self, direction: Direction, timeout: Optional[float] = None) -> int:
         url = self._url(f"/games/{self.game_name}/snake/direction")
-        resp = self.session.post(url, json={"direction": direction}, timeout=self.timeout)
+        resp = self.session.post(
+            url, json={"direction": direction}, timeout=timeout or self.timeout
+        )
         return resp.status_code
 
     def activate_item(self, item: ItemKind) -> int:

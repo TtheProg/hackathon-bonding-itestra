@@ -60,21 +60,32 @@ server's timing**, because both proved unreliable during the event.
   - `choose_direction()` — **anytime iterative-deepening paranoid minimax** with
     alpha-beta. "Paranoid" = modeled opponents jointly pick the worst-for-us reply.
     Calls `on_improve(dir)` each time a deeper search improves the best move.
-- **`main.py`** — the tick loop and the two pieces that work around server quirks:
-  1. **Runtime delta calibration.** `DEFAULT_DELTAS` (NORTH=y-1 etc.) is only a
-     *guess*. Each tick it compares the commanded direction against how our head
-     actually moved and **rewrites the direction→(dx,dy) map** if they disagree.
-     Never hard-code the compass mapping as ground truth.
-  2. **Background `Poster` thread.** Search keeps deepening while a separate thread
-     re-POSTs the current best move. The server token-buckets requests
-     (**HTTP 429 on bursts**, >~3/s), so posts are throttled to `POST_INTERVAL`
-     (0.45s) and only the last post before a tick counts. Timing constants live at
-     the top of `main.py`: `TICK_SECONDS`, `POST_INTERVAL`, `SEARCH_BUDGET`.
+- **`main.py`** — a **tick-phase-locked** loop (not a free-running cadence). Each
+  iteration runs four phases anchored on the server's tick edge `t0`:
+  1. **Detect.** Poll `GET /state` every `POLL_INTERVAL` (50ms) until `tick_token`
+     changes (an explicit `tick`/`turn` counter from the raw payload if present,
+     else a hash of all snake head positions), then anchor `t0 = now`. This
+     re-anchors every tick, so our clock can't drift against the server's — which
+     is what used to make POSTs land *after* the tick locked (the old `LAG`).
+  2. **Calibrate (observe-only).** Compare the commanded direction against how our
+     head actually moved and log `OK`/`LAG`. `DEFAULT_DELTAS` is only a guess but
+     was verified correct via the API steer test, so we **do not** mutate the map
+     (that caused calibration churn); a mismatch is just command lag.
+  3. **Compute.** One full-depth `choose_direction` to `t0 + COMPUTE_BUDGET`
+     (0.75s). An insurance POST of the best-so-far fires from inside the search
+     (via `on_improve`) once the clock passes `EARLY_SEND_MARK` (0.40s).
+  4. **Send.** `send_until_ok` re-POSTs the final move with a short timeout until
+     HTTP 200 or the `[t0+0.75, t0+0.85]` window closes. Only the last post before
+     a tick counts. Timing constants live at the top of `main.py`.
 
 ## Gotchas learned during the event
 
-- **429 rate limiting is the main failure mode.** Keep GET to 1/tick and posts
-  throttled. On a 429 from GET, back off ~0.3s and retry; don't tighten the cadence.
+- **429 rate limiting is a real constraint, handled by phase-locking, not a global
+  throttle.** The token bucket 429s above ~3/s sustained. The phase-locked loop
+  stays gentle by construction: ~2-3 detection GETs clustered at the tick edge,
+  then 1-2 POSTs, with a quiet ~750ms compute gap. During *detection* a GET 429
+  must NOT trigger a long backoff (that blinds us to the edge) — retry fast (~30ms).
+  Send POSTs use a short timeout and stop on the first 200.
 - A finished/stuck game **refuses joins until reset** — that's what `reset_game()` /
   `--auto-reset` are for. If `state_from_field` returns `None` we're not in the game
   yet (registration still pending); keep posting to retry.

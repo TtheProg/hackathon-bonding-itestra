@@ -8,9 +8,9 @@ import time
 D = DEFAULT_DELTAS
 
 
-def st(snakes, apples=(), size=(10, 10), me="me"):
+def st(snakes, apples=(), bad_apples=(), size=(10, 10), me="me"):
     return SimState(size=size, snakes={n: SimSnake(list(b)) for n, b in snakes.items()},
-                    apples=set(apples), me=me)
+                    apples=set(apples), bad_apples=set(bad_apples), me=me)
 
 
 def test_move_and_wrap():
@@ -92,6 +92,31 @@ def test_seeks_apple():
     print(f"ok: apple-seek -> chose {res.direction} (apple west, expect WEST-ish)")
 
 
+def test_tick_token():
+    from Field import Field
+    from main import tick_token
+
+    class FakeApi:
+        def __init__(self, last_raw=None):
+            self.last_raw = last_raw
+
+    def fld(head):
+        return Field.from_dict({
+            "size": [10, 10],
+            "snakes": {"me": {"body": [list(head), [5, 6]], "alive": True}},
+            "items": [],
+        })
+
+    no_raw = FakeApi()
+    # Stable across identical boards, changes when a head moves.
+    assert tick_token(fld((5, 5)), no_raw) == tick_token(fld((5, 5)), no_raw)
+    assert tick_token(fld((5, 5)), no_raw) != tick_token(fld((5, 4)), no_raw)
+    # A raw turn counter, if present, is preferred over the head hash.
+    tok = tick_token(fld((5, 5)), FakeApi(last_raw={"tick": 7}))
+    assert tok[0] == "counter" and tok[2] == 7, tok
+    print("ok: tick_token edge detection")
+
+
 if __name__ == "__main__":
     test_move_and_wrap()
     test_growth()
@@ -101,4 +126,5 @@ if __name__ == "__main__":
     test_never_reverses()
     test_avoids_opponent_body()
     test_seeks_apple()
+    test_tick_token()
     print("ALL SANITY CHECKS PASSED")
