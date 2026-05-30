@@ -266,9 +266,13 @@ def evaluate(state: SimState, depth_left: int) -> float:
         blocked.update(s.body)
     blocked.discard(me.head)
 
-    # One BFS gives both the reachable space (anti-trap) and the true
-    # obstacle-avoiding path distance to the nearest reachable apple.
-    space, _, apple_dist = bfs_field(me.head, blocked, size, state.apples, cells)
+    # Anti-trap flood-fill, CAPPED. We only need to know we won't be boxed in --
+    # the penalty below fires when reachable space drops under our own length.
+    # Counting the whole 41x41 board (1681 cells) at every leaf was the search's
+    # dominant cost; capping at a small multiple of our length lets BFS stop
+    # early in open space (where the exact count doesn't change the decision).
+    space_cap = min(cells, max(2 * me.length, 32))
+    space = flood_fill(me.head, blocked, size, space_cap)
     score = 0.0
     score += me.length * 1000.0          # length is the literal scoreboard
     score += space * 10.0                # don't get boxed in
@@ -276,19 +280,17 @@ def evaluate(state: SimState, depth_left: int) -> float:
     if space < me.length:
         score -= (me.length - space) * 200.0
 
-    # Seek apples by *path* distance. Weighted strongly enough that closing the
-    # distance beats coasting straight, but below the +1000 of eating (via the
-    # length term once the head reaches the apple in a child state).
+    # Seek apples by cheap torus (x/y) distance -- a linear scan over the apple
+    # set, no per-leaf obstacle-aware BFS. choose_direction() already commits the
+    # root move toward a *path-reachable* apple each tick, and trap-avoidance is
+    # the flood-fill term's job, so a wall-ignoring gradient is enough here and
+    # far faster. Weighted to beat coasting straight but stay below the +1000 of
+    # actually eating (via the length term once the head reaches the apple).
     if state.apples:
-        if apple_dist is not None:
-            score -= apple_dist * 30.0
-        else:
-            # No free path to any apple right now (bodies in the way): keep a
-            # weaker straight-line pull plus a penalty for being walled off.
-            nearest = min(torus_dist(me.head, a, size) for a in state.apples)
-            score -= nearest * 30.0 + 80.0
+        nearest = min(torus_dist(me.head, a, size) for a in state.apples)
+        score -= nearest * 30.0
 
-    
+
     if state.bad_apples:
         # Avoid bad apples.
         for bad in state.bad_apples:
