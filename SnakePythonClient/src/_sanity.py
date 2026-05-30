@@ -8,9 +8,9 @@ import time
 D = DEFAULT_DELTAS
 
 
-def st(snakes, apples=(), size=(10, 10), me="me"):
+def st(snakes, apples=(), bad_apples=(), size=(10, 10), me="me"):
     return SimState(size=size, snakes={n: SimSnake(list(b)) for n, b in snakes.items()},
-                    apples=set(apples), me=me)
+                    apples=set(apples), bad_apples=set(bad_apples), me=me)
 
 
 def test_move_and_wrap():
@@ -92,6 +92,31 @@ def test_seeks_apple():
     print(f"ok: apple-seek -> chose {res.direction} (apple west, expect WEST-ish)")
 
 
+def test_safe_filter_survives_bad_calibration():
+    """The hard safety gate must hold even if the compass map is WRONG.
+
+    Reproduces the real-game failure: a momentarily mis-calibrated `deltas` makes
+    `legal_moves`' reversal check mislabel directions, so the reversal-into-neck
+    move slips through. `safe_moves` judges the destination cell instead, so we
+    must still refuse to step onto our own neck regardless of the bad map.
+    """
+    from engine import safe_moves
+    # Head (5,5), neck (4,5): the snake came from the WEST, so stepping WEST is
+    # reversal into the neck. Feed a SCRAMBLED delta map (compass labels rotated)
+    # to prove safety doesn't depend on it being correct.
+    s = st({"me": [(5, 5), (4, 5), (3, 5), (2, 5)]})
+    scrambled = {"NORTH": (-1, 0), "SOUTH": (1, 0), "EAST": (0, 1), "WEST": (0, -1)}
+    safe = safe_moves(s, scrambled)
+    # Whatever label maps to (-1,0) (a step onto the neck at (4,5)) must be gone.
+    for d in safe:
+        nh = ((5 + scrambled[d][0]) % 10, (5 + scrambled[d][1]) % 10)
+        assert nh not in {(5, 5), (4, 5), (3, 5), (2, 5)}, f"{d} steps onto body {nh}"
+    res = choose_direction(s, time.monotonic() + 0.3, scrambled, opp_k=0)
+    rh = ((5 + scrambled[res.direction][0]) % 10, (5 + scrambled[res.direction][1]) % 10)
+    assert rh not in {(4, 5), (3, 5), (2, 5)}, f"chose {res.direction} into body {rh}"
+    print(f"ok: safe filter survives bad calibration -> chose {res.direction}")
+
+
 if __name__ == "__main__":
     test_move_and_wrap()
     test_growth()
@@ -101,4 +126,5 @@ if __name__ == "__main__":
     test_never_reverses()
     test_avoids_opponent_body()
     test_seeks_apple()
+    test_safe_filter_survives_bad_calibration()
     print("ALL SANITY CHECKS PASSED")

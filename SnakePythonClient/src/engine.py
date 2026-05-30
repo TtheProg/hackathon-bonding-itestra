@@ -116,6 +116,44 @@ def legal_moves(snake: SimSnake, deltas, size) -> List[Direction]:
     return moves or list(DIRECTIONS)
 
 
+def safe_moves(state: SimState, deltas) -> List[Direction]:
+    """Root-only HARD safety filter for our own snake.
+
+    A direction is kept only if the cell it lands on is *guaranteed* safe this
+    tick: not occupied by any snake body segment, and not adjacent to any living
+    opponent head (which could step into the same cell for a mutual-death
+    head-to-head). Unlike `legal_moves`, this never trusts the calibrated compass
+    beyond a single step -- it judges the actual destination coordinate -- so a
+    momentarily mis-calibrated `deltas` map cannot let us reverse into our own
+    neck. May return [] (every move looks deadly); the caller then falls back to
+    the search's least-bad choice.
+    """
+    me = state.snakes[state.me]
+    size = state.size
+
+    # Treat every current body segment as a wall. We could let each snake's tail
+    # vacate, but staying conservative here is the whole point: a guaranteed-safe
+    # move is worth more than a clever one when the alternative is dying.
+    bodies = set()
+    enemy_heads = []
+    for n, s in state.snakes.items():
+        if not s.alive:
+            continue
+        bodies.update(s.body)
+        if n != state.me:
+            enemy_heads.append(s.head)
+
+    safe = []
+    for d in DIRECTIONS:
+        nh = step(me.head, d, deltas, size)
+        if nh in bodies:
+            continue  # walks into a body (covers reversal into our own neck)
+        if any(torus_dist(nh, h, size) == 1 for h in enemy_heads):
+            continue  # an enemy head could move in -> head-to-head, both die
+        safe.append(d)
+    return safe
+
+
 # --------------------------------------------------------------------------- #
 # Tick simulation (simultaneous movement + collisions)
 # --------------------------------------------------------------------------- #
@@ -413,6 +451,15 @@ def choose_direction(state: SimState, deadline: float, deltas,
     stats: Dict[str, int] = {"nodes": 0}
     me = state.snakes[state.me]
     moves = legal_moves(me, deltas, state.size)
+
+    # HARD safety gate: if any move lands on a guaranteed-safe cell, restrict the
+    # whole search (and thus the move we POST) to those. This is what stops us
+    # ever reversing into our own neck when the calibrated compass briefly lags.
+    # Only when *every* direction looks deadly do we keep the full set and let the
+    # search pick the least-bad line.
+    safe = safe_moves(state, deltas)
+    if safe:
+        moves = safe
 
     # Move ordering = the tie-break (the search keeps the first move on equal
     # scores). Commit to ONE target apple -- the deterministically-nearest one --
