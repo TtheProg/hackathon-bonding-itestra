@@ -40,6 +40,10 @@ class SnakeFieldAPI:
         self.session.headers.update(
             {"Accept": "application/json", "Content-Type": "application/json"}
         )
+        # Raw JSON of the last GET /state, kept so the caller can log the full
+        # untouched payload. Field.from_dict only keeps a whitelist of fields,
+        # so any server-side score/tick field would otherwise be invisible.
+        self.last_raw: Optional[dict] = None
 
     def _url(self, path: str) -> str:
         return f"{self.base_url}{path}"
@@ -49,7 +53,9 @@ class SnakeFieldAPI:
         resp = self.session.get(url, timeout=self.timeout)
         if resp.status_code != 200:
             raise ApiError(resp.status_code, resp.text)
-        return Field.from_dict(resp.json())
+        raw = resp.json()
+        self.last_raw = raw
+        return Field.from_dict(raw)
 
     def set_direction(self, direction: Direction) -> int:
         url = self._url(f"/games/{self.game_name}/snake/direction")
@@ -67,4 +73,35 @@ class SnakeFieldAPI:
         test games without touching the web UI."""
         url = self._url(f"/games/{self.game_name}/reset")
         resp = self.session.post(url, timeout=self.timeout)
+        return resp.status_code
+
+    def delete_game(self) -> int:
+        resp = self.session.delete(
+            self._url(f"/games/{self.game_name}"), timeout=self.timeout
+        )
+        return resp.status_code
+
+    def create_game(self, size=(10, 10), n_bots: int = 3,
+                    apple_every_ticks: int = 2) -> int:
+        """(Re)create the game with a known-good config. `auto_start_on_player_join`
+        means the round begins the moment we POST our first direction. Seeds a
+        few filler bots so it's a real match (we join as the +1)."""
+        w, h = size
+        spots = [
+            (int(w * 0.2), h // 2),
+            (int(w * 0.8), h // 2),
+            (w // 2, int(h * 0.2)),
+            (w // 2, int(h * 0.8)),
+        ][:n_bots]
+        snakes = [{"alive": True, "body": [[x, y]] * 6} for x, y in spots]
+        body = {
+            "name": self.game_name,
+            "config": {
+                "size": [w, h],
+                "snakes": snakes,
+                "apple_every_ticks": apple_every_ticks,
+                "auto_start_on_player_join": True,
+            },
+        }
+        resp = self.session.post(self._url("/games"), json=body, timeout=self.timeout)
         return resp.status_code

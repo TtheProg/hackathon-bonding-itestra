@@ -62,6 +62,29 @@ def test_avoids_death():
     print(f"ok: avoids death -> chose {res.direction} depth={res.depth}")
 
 
+def test_never_reverses():
+    # heading EAST (head (5,5), neck (4,5)); apple due WEST (behind us).
+    # Reversing to WEST = instant death, so it must NOT choose WEST even though
+    # the apple is that way.
+    s = st({"me": [(5, 5), (4, 5), (3, 5)]}, apples=[(2, 5)])
+    assert "WEST" not in [d for d in __import__("engine").legal_moves(
+        s.snakes["me"], D, s.size)], "WEST (reverse) must be illegal"
+    res = choose_direction(s, time.monotonic() + 0.5, D, opp_k=0)
+    assert res.direction != "WEST", f"reversed into neck! chose {res.direction}"
+    print(f"ok: never reverses -> chose {res.direction}")
+
+
+def test_avoids_opponent_body():
+    # We head EAST straight into an opponent's body wall; must turn away.
+    s = st({
+        "me": [(4, 5), (3, 5)],
+        "opp": [(5, 3), (5, 4), (5, 5), (5, 6), (5, 7)],  # vertical wall at x=5
+    })
+    res = choose_direction(s, time.monotonic() + 0.5, D, opp_k=1)
+    assert res.direction != "EAST", f"ran into opponent wall! chose {res.direction}"
+    print(f"ok: avoids opponent body -> chose {res.direction}")
+
+
 def test_seeks_apple():
     s = st({"me": [(5, 5), (5, 6)]}, apples=[(2, 5)])  # apple to the west
     t0 = time.monotonic()
@@ -75,5 +98,7 @@ if __name__ == "__main__":
     test_self_collision()
     test_head_to_head()
     test_avoids_death()
+    test_never_reverses()
+    test_avoids_opponent_body()
     test_seeks_apple()
     print("ALL SANITY CHECKS PASSED")

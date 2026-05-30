@@ -126,6 +126,19 @@ class Poster(threading.Thread):
         self._stop.set()
 
 
+_KNOWN_RAW_KEYS = {"snake", "snakes", "size", "items"}
+
+
+def raw_extras(api: SnakeFieldAPI) -> str:
+    """Top-level fields in the raw /state payload that Field drops (e.g. a
+    server-side tick or score), so they show up in the logs."""
+    raw = getattr(api, "last_raw", None)
+    if not isinstance(raw, dict):
+        return ""
+    extras = {k: v for k, v in raw.items() if k not in _KNOWN_RAW_KEYS}
+    return f" | raw{extras}" if extras else ""
+
+
 def state_digest(state) -> str:
     parts = []
     for name, s in state.snakes.items():
@@ -143,6 +156,19 @@ def try_reset(api: SnakeFieldAPI, reason: str) -> None:
     except Exception as exc:
         log.warning("reset failed: %s", exc)
     time.sleep(0.8)
+
+
+def try_recreate(api: SnakeFieldAPI, reason: str) -> None:
+    """Last-resort restart: delete and recreate the game with a known-good
+    auto-start config, so a stuck game can't block development."""
+    try:
+        dcode = api.delete_game()
+        ccode = api.create_game()
+        log.info("RECREATE game '%s' (%s) -> delete=%s create=%s",
+                 api.game_name, reason, dcode, ccode)
+    except Exception as exc:
+        log.warning("recreate failed: %s", exc)
+    time.sleep(1.0)
 
 
 def run(api: SnakeFieldAPI, team: str, opp_k: int, auto_reset: bool) -> None:
@@ -180,28 +206,40 @@ def run(api: SnakeFieldAPI, team: str, opp_k: int, auto_reset: bool) -> None:
                 not_appearing += 1
                 log.info("waiting to appear in game '%s' (snakes: %s, try %d)...",
                          api.game_name, list(field.snakes.keys()), not_appearing)
-                # A post-game/stuck game refuses joins; auto-reset to recover.
-                if auto_reset and not_appearing >= 5:
-                    try_reset(api, "could not join")
-                    not_appearing = 0
+                # Escalate recovery: a stuck/post-game state refuses joins.
+                if auto_reset:
+                    if not_appearing == 5:
+                        try_reset(api, "could not join")
+                    elif not_appearing >= 10:
+                        try_recreate(api, "join still failing after reset")
+                        not_appearing = 0
                 time.sleep(0.6)
                 continue
             not_appearing = 0
 
             me = state.snakes[team]
             if not me.alive:
-                alive_others = len(state.alive_names())
-                if auto_reset and alive_others <= 1:
-                    # Round is effectively over -> restart for the next test run.
-                    log.info("snake DEAD (len %d), round over. auto-resetting.",
-                             me.length)
-                    last_direction, prev_head = None, None
-                    try_reset(api, "round over")
-                    continue
-                log.info("snake DEAD (final length %d). standing by for reset.",
-                         me.length)
+                # Log the final standings ("game end and state") then, if
+                # auto-resetting, restart immediately so we don't sit in a game
+                # that may otherwise run forever.
+                standings = sorted(
+                    state.snakes.items(), key=lambda kv: kv[1].length, reverse=True
+                )
+                board = ", ".join(
+                    f"{'*' if n == team else ''}{n}={s.length}"
+                    f"{'(alive)' if s.alive else '†'}"
+                    for n, s in standings
+                )
+                place = [n for n, _ in standings].index(team) + 1
+                log.info("GAME END | our snake DEAD len=%d | place %d/%d | %s",
+                         me.length, place, len(standings), board)
+                log.info("final board:\n%s", render_board(state))
                 last_direction, prev_head = None, None
-                time.sleep(1.0)
+                if auto_reset:
+                    try_reset(api, "our snake died")
+                    best.set("NORTH")  # rejoin immediately -> auto-starts round
+                else:
+                    time.sleep(1.0)
                 continue
 
             # --- did last tick's command actually land? ---
@@ -214,13 +252,14 @@ def run(api: SnakeFieldAPI, team: str, opp_k: int, auto_reset: bool) -> None:
                     expected = deltas[last_direction]
                     if obs == expected:
                         landed_note = f"OK cmd={last_direction} moved={obs}"
-                    elif obs in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                        # head moved, but not how we expected -> fix the mapping
-                        if deltas[last_direction] != obs:
-                            deltas = dict(deltas)
-                            deltas[last_direction] = obs
-                            log.info("CALIBRATED %s -> %s", last_direction, obs)
-                        landed_note = f"REMAPPED cmd={last_direction} moved={obs}"
+                    else:
+                        # Mapping is confirmed correct (verified via the API steer
+                        # test), so a mismatch is the one-tick command lag -- our
+                        # POST landed after the server locked that tick's move, so
+                        # the snake kept its prior heading. NOT a mapping error;
+                        # do not mutate the deltas (that caused calibration churn).
+                        landed_note = (f"LAG cmd={last_direction} "
+                                       f"expected={expected} moved={obs}")
             if me.head != prev_head or prev_head is None:
                 tick_no += 1
             prev_head = me.head
@@ -234,7 +273,8 @@ def run(api: SnakeFieldAPI, team: str, opp_k: int, auto_reset: bool) -> None:
             last_direction = result.direction
 
             # --- log everything ---
-            log.info("=== tick~%d | %s", tick_no, state_digest(state))
+            log.info("=== tick~%d | %s%s", tick_no, state_digest(state),
+                     raw_extras(api))
             log.info("board:\n%s", render_board(state))
             log.info(
                 "DECIDE move=%s depth=%d score=%.0f | last-move: %s",
@@ -263,8 +303,10 @@ def main() -> None:
         "--base_url", default="http://192.168.7.211:3030", help="Game server base URL"
     )
     parser.add_argument(
-        "--opp_k", type=int, default=2,
-        help="How many nearest opponents to model in minimax (branching cost)",
+        "--opp_k", type=int, default=3,
+        help="How many nearest opponents to model in minimax (3 = all in a "
+             "4-snake match). Their bodies are always avoided regardless; this "
+             "controls how many opponents' future moves we branch on.",
     )
     parser.add_argument("--reset", action="store_true",
                         help="Reset the game once before joining")

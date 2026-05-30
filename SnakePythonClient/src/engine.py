@@ -192,21 +192,38 @@ def torus_dist(a: Coord, b: Coord, size: Tuple[int, int]) -> int:
 
 def flood_fill(start: Coord, blocked: set, size: Tuple[int, int], limit: int) -> int:
     """Count free cells reachable from `start` (the cell the head moves into)."""
+    count, _, _ = bfs_field(start, blocked, size, frozenset(), limit)
+    return count
+
+
+def bfs_field(start: Coord, blocked: set, size: Tuple[int, int],
+              targets, limit: int):
+    """Single breadth-first sweep from `start` over free cells (torus).
+
+    Returns (reachable_count, nearest_target, nearest_dist). Because every step
+    costs 1, BFS *is* the optimal-path distance (A* with a zero/admissible
+    heuristic collapses to this), and one sweep from the head yields the true
+    obstacle-avoiding distance to the closest reachable target -- cheaper and
+    more complete than running A* per target. Targets (apples) are passable, so
+    we still count them as reachable space.
+    """
     w, h = size
-    if start in blocked:
-        return 0
     seen = {start}
-    q = deque([start])
+    q = deque([(start, 0)])
     count = 0
+    nearest = None
+    nearest_dist = None
     while q and count < limit:
-        x, y = q.popleft()
+        (x, y), dist = q.popleft()
         count += 1
+        if nearest is None and dist > 0 and (x, y) in targets:
+            nearest, nearest_dist = (x, y), dist
         for dx, dy in ((0, -1), (0, 1), (1, 0), (-1, 0)):
             nb = ((x + dx) % w, (y + dy) % h)
             if nb not in seen and nb not in blocked:
                 seen.add(nb)
-                q.append(nb)
-    return count
+                q.append((nb, dist + 1))
+    return count, nearest, nearest_dist
 
 
 def evaluate(state: SimState, depth_left: int) -> float:
@@ -220,24 +237,37 @@ def evaluate(state: SimState, depth_left: int) -> float:
         # the extra plies survived (depth_left is high near the root).
         return -1e9 - depth_left * 1e6
 
-    # Free space = everything not currently a snake body. Tails will move, but
-    # treating bodies as blocked is a safe, cheap approximation.
+    # Free space reachable from our head = anti-trap signal. Block every snake
+    # body, but NOT our own head cell (that's where we measure *from* -- leaving
+    # it in `blocked` made flood_fill start on a blocked cell and always return
+    # 0, silently disabling this whole term).
     blocked = set()
     for s in state.snakes.values():
         if s.alive:
             blocked.update(s.body)
+    blocked.discard(me.head)
 
-    space = flood_fill(me.head, blocked, size, limit=cells)
+    # One BFS gives both the reachable space (anti-trap) and the true
+    # obstacle-avoiding path distance to the nearest reachable apple.
+    space, _, apple_dist = bfs_field(me.head, blocked, size, state.apples, cells)
     score = 0.0
     score += me.length * 1000.0          # length is the literal scoreboard
-    score += space * 12.0                # don't get boxed in
+    score += space * 10.0                # don't get boxed in
+    # If we can't even reach as many cells as our own length, we're trapped.
+    if space < me.length:
+        score -= (me.length - space) * 200.0
 
-    # Seek apples, weighted well below survival/space.
+    # Seek apples by *path* distance. Weighted strongly enough that closing the
+    # distance beats coasting straight, but below the +1000 of eating (via the
+    # length term once the head reaches the apple in a child state).
     if state.apples:
-        nearest = min(torus_dist(me.head, a, size) for a in state.apples)
-        score -= nearest * 8.0
-        if nearest == 0:
-            score += 400.0
+        if apple_dist is not None:
+            score -= apple_dist * 30.0
+        else:
+            # No free path to any apple right now (bodies in the way): keep a
+            # weaker straight-line pull plus a penalty for being walled off.
+            nearest = min(torus_dist(me.head, a, size) for a in state.apples)
+            score -= nearest * 30.0 + 80.0
 
     # Mild bonus for outliving opponents.
     opponents_alive = sum(
@@ -270,12 +300,21 @@ class SearchResult:
     completed: bool
 
 
-def _nearby_opponents(state: SimState, k: int) -> List[str]:
+# Only branch on opponents whose head is within this many cells of ours: a
+# snake further away cannot collide with us inside the search horizon, so
+# enumerating its moves only burns time (its body is still always an obstacle).
+# This lets the search go deep when enemies are far and stay careful when close.
+THREAT_RADIUS = 6
+
+
+def _nearby_opponents(state: SimState, k: int,
+                      max_dist: int = THREAT_RADIUS) -> List[str]:
     me = state.snakes[state.me]
     others = [
-        (torus_dist(me.head, s.head, state.size), n)
+        (d, n)
         for n, s in state.snakes.items()
         if n != state.me and s.alive
+        and (d := torus_dist(me.head, s.head, state.size)) <= max_dist
     ]
     others.sort()
     return [n for _, n in others[:k]]
@@ -338,14 +377,35 @@ def choose_direction(state: SimState, deadline: float, deltas,
     me = state.snakes[state.me]
     moves = legal_moves(me, deltas, state.size)
 
-    # Tie-break preference: keep going straight. Ties keep the first move tried,
-    # so put the current heading first -> the snake glides purposefully in open
-    # space instead of snapping to a fixed compass direction.
+    # Move ordering = the tie-break (the search keeps the first move on equal
+    # scores). Commit to ONE target apple -- the deterministically-nearest one --
+    # and try the move that gets closest to it first. Without this, apples
+    # flanking the head leave every move equally "good", so the snake defers the
+    # turn every tick and never actually eats. Fall back to going straight.
     heading = me.heading(state.size)
-    if heading is not None:
-        straight = next((d for d in moves if deltas[d] == heading), None)
-        if straight is not None:
-            moves = [straight] + [d for d in moves if d != straight]
+    target = None
+    if state.apples:
+        # Prefer the nearest apple reachable by an actual path (BFS around
+        # bodies); fall back to straight-line nearest if all are walled off.
+        blocked = set()
+        for s in state.snakes.values():
+            if s.alive:
+                blocked.update(s.body)
+        blocked.discard(me.head)
+        _, target, _ = bfs_field(me.head, blocked, state.size, state.apples,
+                                 state.size[0] * state.size[1])
+        if target is None:
+            target = min(state.apples,
+                         key=lambda a: (torus_dist(me.head, a, state.size),
+                                        a[0], a[1]))
+
+    def order_key(d: Direction):
+        nh = step(me.head, d, deltas, state.size)
+        to_target = torus_dist(nh, target, state.size) if target else 0
+        straight_pref = 0 if (heading and deltas[d] == heading) else 1
+        return (to_target, straight_pref)
+
+    moves.sort(key=order_key)
 
     # Greedy fallback so we always have *some* answer instantly: the move that
     # maximises immediate free space (and nudges toward apples).
