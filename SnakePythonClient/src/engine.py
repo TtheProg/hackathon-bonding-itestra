@@ -328,6 +328,8 @@ class SearchResult:
     score: float
     depth: int
     completed: bool
+    nodes: int = 0      # game-tree nodes expanded (search cost this tick)
+    elapsed_ms: float = 0.0  # wall time spent inside choose_direction
 
 
 # Only branch on opponents whose head is within this many cells of ours: a
@@ -363,9 +365,10 @@ def _opponent_joint_moves(state: SimState, opponents: List[str], deltas):
 
 
 def _search(state: SimState, depth: int, alpha: float, beta: float,
-            deadline: float, deltas, opp_k: int) -> float:
+            deadline: float, deltas, opp_k: int, stats: Dict[str, int]) -> float:
     if time.monotonic() > deadline:
         raise TimeUp
+    stats["nodes"] += 1
     me = state.snakes[state.me]
     if not me.alive or len(state.alive_names()) <= 1 or depth == 0:
         return evaluate(state, depth)
@@ -381,7 +384,7 @@ def _search(state: SimState, depth: int, alpha: float, beta: float,
             moves = dict(opp_moves)
             moves[state.me] = my_move
             child = simulate(state, moves, deltas)
-            val = _search(child, depth - 1, alpha, beta, deadline, deltas, opp_k)
+            val = _search(child, depth - 1, alpha, beta, deadline, deltas, opp_k, stats)
             if val < worst:
                 worst = val
             if worst <= alpha:
@@ -404,6 +407,8 @@ def choose_direction(state: SimState, deadline: float, deltas,
     called every time a deeper, completed search yields a (possibly new) best
     move, so the caller can post it immediately.
     """
+    search_start = time.monotonic()
+    stats: Dict[str, int] = {"nodes": 0}
     me = state.snakes[state.me]
     moves = legal_moves(me, deltas, state.size)
 
@@ -466,7 +471,7 @@ def choose_direction(state: SimState, deadline: float, deltas,
                         mv[state.me] = my_move
                         child = simulate(state, mv, deltas)
                         val = _search(child, depth - 1, alpha, INF,
-                                      deadline, deltas, opp_k)
+                                      deadline, deltas, opp_k, stats)
                         worst = min(worst, val)
                         if worst <= alpha:
                             break
@@ -474,7 +479,7 @@ def choose_direction(state: SimState, deadline: float, deltas,
                 else:
                     child = simulate(state, {state.me: my_move}, deltas)
                     val = _search(child, depth - 1, alpha, INF,
-                                  deadline, deltas, opp_k)
+                                  deadline, deltas, opp_k, stats)
                 if val > depth_best_score:
                     depth_best_score = val
                     depth_best_dir = my_move
@@ -489,7 +494,9 @@ def choose_direction(state: SimState, deadline: float, deltas,
         if best_score <= -1e8:
             break
 
-    return SearchResult(best_dir, best_score, best_depth, completed=True)
+    elapsed_ms = (time.monotonic() - search_start) * 1000.0
+    return SearchResult(best_dir, best_score, best_depth, completed=True,
+                        nodes=stats["nodes"], elapsed_ms=elapsed_ms)
 
 
 # --------------------------------------------------------------------------- #

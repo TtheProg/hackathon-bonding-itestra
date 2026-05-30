@@ -16,6 +16,7 @@ the POST status, and whether last tick's command actually moved our head. Logs
 go to the console and to ../logs/ouroboros-<timestamp>.log.
 """
 import argparse
+import contextlib
 import logging
 import os
 import threading
@@ -37,10 +38,41 @@ from engine import (
 log = logging.getLogger("ouroboros")
 
 TICK_SECONDS = 1.0
+# Hard target: finish ALL per-tick work (GET + search + logging) within half the
+# tick. Running close to the full 1s is fatal -- one slow GET and we miss the
+# server tick entirely, so we keep a large safety margin.
+CYCLE_BUDGET = 0.50
+# Anytime search deadline, measured from the TOP of the tick (so a slow GET eats
+# into it rather than adding on top). Kept a hair under CYCLE_BUDGET to leave
+# room for the logging block; total work lands at ~SEARCH_BUDGET + a few ms.
+SEARCH_BUDGET = 0.45
+# A GET this slow has already eaten most of the search budget -- surface it.
+GET_WARN_MS = 150.0
 # The server token-buckets requests; >~3/s triggers 429. We do 1 GET/tick plus
 # throttled posts. Only the most recent post before the tick is used.
 POST_INTERVAL = 0.45
-SEARCH_BUDGET = 0.80
+
+
+@contextlib.contextmanager
+def timed(label: str, sink: Optional[Dict[str, float]] = None,
+          warn_ms: Optional[float] = None):
+    """Measure the wall time of a costly block in milliseconds.
+
+    Records into `sink[label]` (so the tick summary can report it) and logs the
+    timing at DEBUG. If `warn_ms` is given and exceeded, logs at WARNING instead,
+    so a slow operation surfaces on the console even without -v.
+    """
+    start = time.monotonic()
+    try:
+        yield
+    finally:
+        ms = (time.monotonic() - start) * 1000.0
+        if sink is not None:
+            sink[label] = ms
+        if warn_ms is not None and ms > warn_ms:
+            log.warning("SLOW %s took %.1f ms (> %.0f ms)", label, ms, warn_ms)
+        else:
+            log.debug("timing %s = %.1f ms", label, ms)
 
 
 def setup_logging(verbose: bool) -> str:
@@ -181,12 +213,21 @@ def run(api: SnakeFieldAPI, team: str, opp_k: int, auto_reset: bool) -> None:
     prev_head: Optional[Tuple[int, int]] = None
     tick_no = 0
     not_appearing = 0
+    # Start of the previous *decision* tick, to measure the real loop period
+    # (how long between two moves -- should track the server's 1s tick).
+    prev_tick_start: Optional[float] = None
 
     try:
         while True:
             cycle_start = time.monotonic()
+            period_ms = (
+                (cycle_start - prev_tick_start) * 1000.0
+                if prev_tick_start is not None else None
+            )
+            timings: Dict[str, float] = {}
             try:
-                field = api.get_field()
+                with timed("GET state", timings, warn_ms=GET_WARN_MS):
+                    field = api.get_field()
             except ApiError as exc:
                 if exc.status == 429:
                     time.sleep(0.3)
@@ -267,27 +308,50 @@ def run(api: SnakeFieldAPI, team: str, opp_k: int, auto_reset: bool) -> None:
             # --- decide ---
             posts_before = poster.posts_total
             deadline = cycle_start + SEARCH_BUDGET
-            result: SearchResult = choose_direction(
-                state, deadline, deltas, opp_k=opp_k, on_improve=best.set
-            )
+            with timed("search", timings):
+                result: SearchResult = choose_direction(
+                    state, deadline, deltas, opp_k=opp_k, on_improve=best.set
+                )
             last_direction = result.direction
 
             # --- log everything ---
-            log.info("=== tick~%d | %s%s", tick_no, state_digest(state),
-                     raw_extras(api))
-            log.info("board:\n%s", render_board(state))
-            log.info(
-                "DECIDE move=%s depth=%d score=%.0f | last-move: %s",
-                result.direction, result.depth, result.score, landed_note,
-            )
-            log.info(
-                "POST status: last=%s dir=%s | totals ok=%d 429=%d all=%d (+%d this tick)",
-                poster.last_status, poster.last_direction, poster.posts_ok,
-                poster.posts_429, poster.posts_total,
-                poster.posts_total - posts_before,
-            )
+            with timed("logging", timings):
+                log.info("=== tick~%d | %s%s", tick_no, state_digest(state),
+                         raw_extras(api))
+                log.info("board:\n%s", render_board(state))
+                log.info(
+                    "DECIDE move=%s depth=%d score=%.0f | last-move: %s",
+                    result.direction, result.depth, result.score, landed_note,
+                )
+                log.info(
+                    "POST status: last=%s dir=%s | totals ok=%d 429=%d all=%d (+%d this tick)",
+                    poster.last_status, poster.last_direction, poster.posts_ok,
+                    poster.posts_429, poster.posts_total,
+                    poster.posts_total - posts_before,
+                )
 
+            # --- timing summary: did we stay inside the half-tick budget? ---
             elapsed = time.monotonic() - cycle_start
+            work_ms = elapsed * 1000.0
+            tick_ms = TICK_SECONDS * 1000.0
+            cap_ms = CYCLE_BUDGET * 1000.0
+            if work_ms > tick_ms:
+                status = "MISSED-TICK"   # fatal: ran past the server's tick
+            elif work_ms > cap_ms:
+                status = "OVER-BUDGET"   # past our 0.5s half-tick target
+            else:
+                status = "OK"
+            period_str = f" period={period_ms:.0f}ms" if period_ms is not None else ""
+            timing_line = (
+                "TIMING %s work=%.0fms (get=%.0f search=%.0f/d%d/n%d log=%.0f)"
+                "%s cap=%.0fms tick=%.0fms"
+                % (status, work_ms, timings.get("GET state", 0.0),
+                   timings.get("search", 0.0), result.depth, result.nodes,
+                   timings.get("logging", 0.0), period_str, cap_ms, tick_ms)
+            )
+            (log.info if status == "OK" else log.warning)(timing_line)
+
+            prev_tick_start = cycle_start
             if elapsed < TICK_SECONDS:
                 time.sleep(TICK_SECONDS - elapsed)
     finally:
@@ -297,10 +361,10 @@ def run(api: SnakeFieldAPI, team: str, opp_k: int, auto_reset: bool) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Ouroboros snake bot")
     parser.add_argument("--team_name", default="Ouroboros", help="Team/snake name")
-    parser.add_argument("--game_name", default="diamond-Ouroboros", help="Game to join")
-    parser.add_argument("--password", default="hermeticism", help="Server password")
+    parser.add_argument("--game_name", default="braveFalcon", help="Game to join")
+    parser.add_argument("--password", default="test", help="Server password")
     parser.add_argument(
-        "--base_url", default="http://192.168.7.211:3030", help="Game server base URL"
+        "--base_url", default="http://192.168.4.22:3030", help="Game server base URL"
     )
     parser.add_argument(
         "--opp_k", type=int, default=3,
@@ -318,8 +382,10 @@ def main() -> None:
     args = parser.parse_args()
 
     logpath = setup_logging(args.verbose)
+    # Cap HTTP at well under SEARCH_BUDGET so a stalled GET can't, by itself,
+    # blow the half-tick cycle budget -- we abandon it and retry next tick.
     api = SnakeFieldAPI(
-        args.base_url, args.team_name, args.game_name, args.password, timeout=0.5
+        args.base_url, args.team_name, args.game_name, args.password, timeout=0.3
     )
     log.info("Ouroboros -> %s game=%s as %s | reset=%s auto_reset=%s | logfile=%s",
              args.base_url, args.game_name, args.team_name,
