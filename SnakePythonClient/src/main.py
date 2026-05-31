@@ -41,13 +41,20 @@ from engine import (
 
 log = logging.getLogger("ouroboros")
 
+# The server tick is wall-clock aligned: it ticks at the top of every second
+# (synchronized via NTP). Our machine's clock is NTP-synced too, so we don't
+# detect the edge at all -- we schedule against time.time() relative to each
+# second boundary t0. Budget is ~3 req/s, spent as exactly 1 GET + 2 POSTs:
+#   GET at t0+0.050  (50ms after the tick, the fresh board is up)
+#   POST at t0+0.450 (insurance: best move so far)
+#   POST at t0+0.800 (final: last post before the next tick wins)
 TICK_SECONDS = 1.0
-POLL_INTERVAL = 0.05      # detection GET cadence while hunting the tick edge
-EARLY_SEND_MARK = 0.40    # fire the insurance post at t0 + this (from on_improve)
-COMPUTE_BUDGET = 0.75     # total minimax deadline measured from the tick edge t0
-FINAL_SEND_BUDGET = 0.10  # window [t0+0.75, t0+0.85] to land a 200
-SEND_TIMEOUT = 0.08       # per-POST timeout in both send phases
-DETECT_TIMEOUT = 0.08     # per-GET timeout while polling for the edge
+GET_OFFSET = 0.050
+INSURANCE_OFFSET = 0.450
+FINAL_OFFSET = 0.600      # post before the server's input cutoff (was 0.800 -> late -> LAG)
+SEND_TIMEOUT = 0.20       # per-POST timeout
+GET_TIMEOUT = 0.30        # per-GET timeout
+INSURANCE_ENABLED = False  # the t0+450ms "insurance" POST (off = test: 1 GET + 1 POST/tick)
 # Keys the server might use for a turn counter; preferred over the head-hash
 # edge signal if one actually shows up in the raw /state payload.
 _TICK_KEYS = ("tick", "turn", "round", "step", "frame")
@@ -108,30 +115,27 @@ class SendStats:
         self.n_429 = 0
 
 
-def send_until_ok(api: SnakeFieldAPI, direction, deadline: float,
-                  stats: SendStats) -> bool:
-    """POST `direction` (short timeout) until HTTP 200 or `deadline` passes.
+def post_once(api: SnakeFieldAPI, direction, stats: SendStats) -> Optional[int]:
+    """Single POST of `direction`. Returns the status code (or None on error).
 
-    One 200 registers the move for the next tick, so we stop on the first. A
-    small gap between attempts keeps a fast-429ing server from being hammered.
-    Returns True if a 200 landed.
+    The server uses the *last* direction posted before a tick, and our request
+    budget is tiny (~3/s shared with GETs), so we post once and move on rather
+    than retrying -- the two posts per tick (insurance + final) give two chances
+    spaced far enough apart for the token bucket to refill between them.
     """
-    while True:
-        try:
-            code = api.set_direction(direction, timeout=SEND_TIMEOUT)
-            stats.total += 1
-            stats.last_status = code
-            stats.last_direction = direction
-            if code == 200:
-                stats.ok += 1
-                return True
-            if code == 429:
-                stats.n_429 += 1
-        except Exception as exc:
-            log.debug("POST %s failed: %s", direction, exc)
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.04)
+    try:
+        code = api.set_direction(direction, timeout=SEND_TIMEOUT)
+        stats.total += 1
+        stats.last_status = code
+        stats.last_direction = direction
+        if code == 200:
+            stats.ok += 1
+        elif code == 429:
+            stats.n_429 += 1
+        return code
+    except Exception as exc:
+        log.debug("POST %s failed: %s", direction, exc)
+        return None
 
 
 _KNOWN_RAW_KEYS = {"snake", "snakes", "size", "items"}
@@ -179,95 +183,87 @@ def try_recreate(api: SnakeFieldAPI, reason: str) -> None:
     time.sleep(1.0)
 
 
+def _sleep_until(wall_target: float) -> None:
+    """Sleep until a specific wall-clock time (time.time())."""
+    dt = wall_target - time.time()
+    if dt > 0:
+        time.sleep(dt)
+
+
+def _edge_ms(t: Optional[float] = None) -> float:
+    """Milliseconds past the most recent wall-clock second boundary (= the
+    server's NTP-aligned tick edge). With our schedule a GET should read ~50,
+    the insurance POST ~450, and the final POST ~800. Large drift here means our
+    requests aren't actually landing where we think relative to the tick."""
+    if t is None:
+        t = time.time()
+    return (t - int(t)) * 1000.0
+
+
 def run(api: SnakeFieldAPI, team: str, opp_k: int, auto_reset: bool) -> None:
     deltas = dict(DEFAULT_DELTAS)
     stats = SendStats()
     last_direction = None
     prev_head: Optional[Tuple[int, int]] = None
-    prev_token = None
     tick_no = 0
     not_appearing = 0
+    reported_dead = False
 
     while True:
-        # ---- DETECT: poll until the board advances to a new tick edge ----
-        # While alive and joined, GET fast (every POLL_INTERVAL) until tick_token
-        # changes, then anchor t0 = now. A None state (not joined) or a dead
-        # snake has no edge to lock to, so we break out and handle it below.
-        t0 = None
-        field = state = None
-        while True:
-            try:
-                field = api.get_field(timeout=DETECT_TIMEOUT)
-            except ApiError as exc:
-                # A 429 here must NOT blind us with a long backoff -- retry fast.
-                time.sleep(0.03 if exc.status == 429 else 0.1)
-                if exc.status != 429:
-                    log.debug("GET state -> %s", exc)
-                continue
-            except Exception as exc:
-                log.debug("GET state failed: %s", exc)
-                time.sleep(0.1)
-                continue
+        # The server tick fires at the top of each wall-clock second (NTP-aligned),
+        # so t0 = the next second boundary. We schedule GET/POSTs relative to it.
+        t0 = float(int(time.time())) + 1.0
 
-            state = state_from_field(field, team)
-            if state is None or not state.snakes[team].alive:
-                break  # handled outside the detect loop
+        # ---- GET the fresh board shortly after the tick ----
+        _sleep_until(t0 + GET_OFFSET)
+        get_off = _edge_ms()
+        try:
+            field = api.get_field(timeout=GET_TIMEOUT)
+        except ApiError as exc:
+            log.debug("GET state -> HTTP %s", exc.status)
+            continue
+        except Exception as exc:
+            log.debug("GET state failed: %s", exc)
+            continue
 
-            token = tick_token(field, api)
-            if prev_token is None or token != prev_token:
-                prev_token = token
-                t0 = time.monotonic()
-                break
-            time.sleep(POLL_INTERVAL)  # same tick: wait for the board to advance
+        state = state_from_field(field, team)
 
-        # ---- not in the game yet ----
+        # ---- not in the game yet: nudge a join, then wait for the next second ----
         if state is None:
             not_appearing += 1
+            reported_dead = False
             log.info("waiting to appear in game '%s' (snakes: %s, try %d)...",
                      api.game_name, list(field.snakes.keys()), not_appearing)
-            try:
-                api.set_direction("NORTH", timeout=SEND_TIMEOUT)  # nudge join
-            except Exception:
-                pass
-            if auto_reset:
-                if not_appearing == 5:
-                    try_reset(api, "could not join")
-                elif not_appearing >= 10:
-                    try_recreate(api, "join still failing after reset")
-                    not_appearing = 0
-            prev_token, last_direction, prev_head = None, None, None
+            post_once(api, "NORTH", stats)  # joining = post a direction with our auth
+            if auto_reset and not_appearing == 5:
+                try_reset(api, "could not join")
+            last_direction, prev_head = None, None
             continue
+        not_appearing = 0
 
         me = state.snakes[team]
         if not me.alive:
-            # Log final standings ("game end and state"); auto-reset restarts now
-            # so we don't sit in a game that may otherwise run forever.
-            standings = sorted(
-                state.snakes.items(), key=lambda kv: kv[1].length, reverse=True
-            )
-            board = ", ".join(
-                f"{'*' if n == team else ''}{n}={s.length}"
-                f"{'(alive)' if s.alive else '†'}"
-                for n, s in standings
-            )
-            place = [n for n, _ in standings].index(team) + 1
-            log.info("GAME END | our snake DEAD len=%d | place %d/%d | %s",
-                     me.length, place, len(standings), board)
-            log.info("final board:\n%s", render_board(state))
-            prev_token, last_direction, prev_head = None, None, None
-            if auto_reset:
-                time.sleep(1.0)
-                try_reset(api, "our snake died")
-                try:
-                    api.set_direction("NORTH", timeout=SEND_TIMEOUT)  # auto-start
-                except Exception:
-                    pass
-            else:
-                time.sleep(1.0)
+            # Report the final standings once, then sit quietly until the game is
+            # (manually) reset -- this server doesn't accept programmatic resets.
+            if not reported_dead:
+                standings = sorted(
+                    state.snakes.items(), key=lambda kv: kv[1].length, reverse=True
+                )
+                board = ", ".join(
+                    f"{'*' if n == team else ''}{n}={s.length}"
+                    f"{'(alive)' if s.alive else '†'}"
+                    for n, s in standings
+                )
+                place = [n for n, _ in standings].index(team) + 1
+                log.info("GAME END | our snake DEAD len=%d | place %d/%d | %s",
+                         me.length, place, len(standings), board)
+                log.info("final board:\n%s", render_board(state))
+                reported_dead = True
+            last_direction, prev_head = None, None
             continue
+        reported_dead = False
 
-        # ---- tick state, anchored at t0, and we are alive ----
-        # --- did last tick's command actually land? ---
+        # ---- alive: did last tick's command actually land? ----
         landed_note = "first-move"
         if last_direction and prev_head is not None:
             obs = observed_delta(prev_head, me.head, state.size)
@@ -276,80 +272,76 @@ def run(api: SnakeFieldAPI, team: str, opp_k: int, auto_reset: bool) -> None:
                 landed_note = f"OK cmd={last_direction} moved={obs}"
             else:
                 # Mapping is confirmed correct (verified via the API steer test),
-                # so a mismatch is the one-tick command lag -- our POST landed
-                # after the server locked that tick's move. NOT a mapping error;
-                # do not mutate the deltas (that caused calibration churn).
+                # so a mismatch is one-tick command lag -- our POST landed after the
+                # server locked that move. NOT a mapping error; don't mutate deltas.
                 landed_note = (f"LAG cmd={last_direction} "
                                f"expected={expected} moved={obs}")
         tick_no += 1
         prev_head = me.head
 
-        # ---- COMPUTE: one full-depth search; insurance post fires from inside ----
+        # ---- COMPUTE until the final-send mark; insurance POST fires mid-search ----
         posts_before = stats.total
         sent_insurance = False
+        insurance_wall = t0 + INSURANCE_OFFSET
+        ins_off = None  # ms-past-second the insurance POST actually fired
 
         def on_improve(direction):
-            # First time the search has a best move at/after the 400 ms mark,
-            # fire a single quick insurance POST so the server holds a sane move
-            # even if the final send later 429s. One attempt only -- this blocks
-            # the search for the POST, so we don't retry here.
-            nonlocal sent_insurance
-            if not sent_insurance and time.monotonic() >= t0 + EARLY_SEND_MARK:
+            # First completed-depth at/after the insurance mark posts the best move
+            # so far, so the server holds a sane move even if the final POST 429s.
+            nonlocal sent_insurance, ins_off
+            if (INSURANCE_ENABLED and not sent_insurance
+                    and time.time() >= insurance_wall):
                 sent_insurance = True
-                try:
-                    code = api.set_direction(direction, timeout=SEND_TIMEOUT)
-                    stats.total += 1
-                    stats.last_status = code
-                    stats.last_direction = direction
-                    if code == 200:
-                        stats.ok += 1
-                    elif code == 429:
-                        stats.n_429 += 1
-                except Exception as exc:
-                    log.debug("insurance POST failed: %s", exc)
+                ins_off = _edge_ms()
+                post_once(api, direction, stats)
 
+        # choose_direction deadlines on monotonic time; translate the wall-clock
+        # final-send mark into a monotonic deadline.
+        deadline_mono = time.monotonic() + max(0.0, (t0 + FINAL_OFFSET) - time.time())
         result: SearchResult = choose_direction(
-            state, t0 + COMPUTE_BUDGET, deltas, opp_k=opp_k, on_improve=on_improve
+            state, deadline_mono, deltas, opp_k=opp_k, on_improve=on_improve
         )
         last_direction = result.direction
 
-        # ---- FINAL SEND: land the authoritative move before the next tick ----
-        landed = send_until_ok(
-            api, result.direction, t0 + COMPUTE_BUDGET + FINAL_SEND_BUDGET, stats
-        )
+        # ---- FINAL POST: the authoritative move, last post before the next tick ----
+        _sleep_until(t0 + FINAL_OFFSET)
+        fin_off = _edge_ms()
+        final_code = post_once(api, result.direction, stats)
 
         # ---- log everything ----
         log.info("=== tick~%d | %s%s", tick_no, state_digest(state),
                  raw_extras(api))
         log.info("board:\n%s", render_board(state))
         log.info(
-            "DECIDE move=%s depth=%d score=%.0f | last-move: %s",
-            result.direction, result.depth, result.score, landed_note,
+            "DECIDE move=%s depth=%d score=%.0f nodes=%d %.0fms | last-move: %s",
+            result.direction, result.depth, result.score,
+            getattr(result, "nodes", 0), getattr(result, "elapsed_ms", 0.0),
+            landed_note,
         )
         log.info(
-            "POST: final=%s last=%s dir=%s | insurance=%s | totals ok=%d 429=%d "
-            "all=%d (+%d this tick)",
-            "200" if landed else "MISS", stats.last_status, stats.last_direction,
-            "yes" if sent_insurance else "no", stats.ok, stats.n_429, stats.total,
-            stats.total - posts_before,
+            "POST: final=%s dir=%s | TIMING get@+%.0f ins@%s final@+%.0f ms | "
+            "reqs=%d | totals ok=%d 429=%d all=%d",
+            final_code, result.direction, get_off,
+            f"+{ins_off:.0f}" if ins_off is not None else "off", fin_off,
+            stats.total - posts_before, stats.ok, stats.n_429, stats.total,
         )
-        # No trailing sleep: the detect poll above naturally waits for the next
-        # tick edge, re-anchoring t0 every tick.
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Ouroboros snake bot")
     parser.add_argument("--team_name", default="Ouroboros", help="Team/snake name")
-    parser.add_argument("--game_name", default="BracketA", help="Game to join")
-    parser.add_argument("--password", default="hermeticism", help="Server password")
+    parser.add_argument("--game_name", default="vividLion", help="Game to join")
+    parser.add_argument("--password", default="test", help="Server password")
     parser.add_argument(
-        "--base_url", default="http://192.168.3.13:3030", help="Game server base URL"
+        "--base_url", default="http://192.168.5.16:3030", help="Game server base URL"
     )
     parser.add_argument(
-        "--opp_k", type=int, default=3,
-        help="How many nearest opponents to model in minimax (3 = all in a "
-             "4-snake match). Their bodies are always avoided regardless; this "
-             "controls how many opponents' future moves we branch on.",
+        "--opp_k", type=int, default=2,
+        help="How many nearest opponents to model in minimax. Each one multiplies "
+             "the branching factor, so this trades threat-awareness for search "
+             "depth. On the 21x21/12-snake board, k=2 reaches depth ~4-7 and "
+             "survives; k=3 bottoms out at depth ~2. Opponent bodies are always "
+             "avoided regardless of k.",
     )
     parser.add_argument("--reset", action="store_true",
                         help="Reset the game once before joining")

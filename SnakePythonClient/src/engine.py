@@ -116,6 +116,44 @@ def legal_moves(snake: SimSnake, deltas, size) -> List[Direction]:
     return moves or list(DIRECTIONS)
 
 
+def safe_moves(state: SimState, deltas) -> List[Direction]:
+    """Root-only HARD safety filter for our own snake.
+
+    A direction is kept only if the cell it lands on is *guaranteed* safe this
+    tick: not occupied by any snake body segment, and not adjacent to any living
+    opponent head (which could step into the same cell for a mutual-death
+    head-to-head). Unlike `legal_moves`, this never trusts the calibrated compass
+    beyond a single step -- it judges the actual destination coordinate -- so a
+    momentarily mis-calibrated `deltas` map cannot let us reverse into our own
+    neck. May return [] (every move looks deadly); the caller then falls back to
+    the search's least-bad choice.
+    """
+    me = state.snakes[state.me]
+    size = state.size
+
+    # Treat every current body segment as a wall. We could let each snake's tail
+    # vacate, but staying conservative here is the whole point: a guaranteed-safe
+    # move is worth more than a clever one when the alternative is dying.
+    bodies = set()
+    enemy_heads = []
+    for n, s in state.snakes.items():
+        if not s.alive:
+            continue
+        bodies.update(s.body)
+        if n != state.me:
+            enemy_heads.append(s.head)
+
+    safe = []
+    for d in DIRECTIONS:
+        nh = step(me.head, d, deltas, size)
+        if nh in bodies:
+            continue  # walks into a body (covers reversal into our own neck)
+        if any(torus_dist(nh, h, size) == 1 for h in enemy_heads):
+            continue  # an enemy head could move in -> head-to-head, both die
+        safe.append(d)
+    return safe
+
+
 # --------------------------------------------------------------------------- #
 # Tick simulation (simultaneous movement + collisions)
 # --------------------------------------------------------------------------- #
@@ -246,6 +284,22 @@ def bfs_field(start: Coord, blocked: set, size: Tuple[int, int],
     return count, nearest, nearest_dist
 
 
+# --------------------------------------------------------------------------- #
+# Heuristic weights (tunable). DOCTRINE: outlive the opponents. Survival (space,
+# not getting trapped, killing rivals) dominates; growth is barely rewarded.
+# --------------------------------------------------------------------------- #
+W_LENGTH = 50.0           # length is no longer the goal -- just a faint nudge
+W_SPACE = 40.0            # staying in open space is now a primary objective
+W_TRAP = 500.0            # being boxed in (reachable space < our length) is dire
+W_APPLE = 5.0             # only a whisper of a pull toward food
+W_BADAPPLE_ON = 300.0     # stepping onto a hazard, de-emphasised
+W_BADAPPLE_NEAR = 20.0    # proximity repulsion from hazards, de-emphasised
+W_OPP_ALIVE = 500.0       # each living opponent is a heavy standing penalty
+W_H2H = 150.0             # BONUS for pressuring an enemy head (was a penalty)
+DEATH_BASE = 1e9          # dying is catastrophic; scaled exponentially by how
+                          # soon it happens (see evaluate()).
+
+
 def evaluate(state: SimState, depth_left: int) -> float:
     """Score the position from our point of view. Higher is better."""
     me = state.snakes[state.me]
@@ -253,9 +307,10 @@ def evaluate(state: SimState, depth_left: int) -> float:
     cells = size[0] * size[1]
 
     if not me.alive:
-        # Dying is terrible; dying sooner is worse than dying later, so reward
-        # the extra plies survived (depth_left is high near the root).
-        return -1e9 - depth_left * 1e6
+        # Dying ends our run. Catastrophic -- and dying *sooner* (more plies left
+        # in the search => closer to the present) is *exponentially* worse, so we
+        # claw for every extra tick of survival rather than trading them cheaply.
+        return -DEATH_BASE * (2.0 ** depth_left)
 
     # Free space reachable from our head = anti-trap signal. Block every snake
     # body, but NOT our own head cell (that's where we measure *from* -- leaving
@@ -266,51 +321,51 @@ def evaluate(state: SimState, depth_left: int) -> float:
         blocked.update(s.body)
     blocked.discard(me.head)
 
-    # One BFS gives both the reachable space (anti-trap) and the true
-    # obstacle-avoiding path distance to the nearest reachable apple.
-    space, _, apple_dist = bfs_field(me.head, blocked, size, state.apples, cells)
+    # Anti-trap flood-fill, CAPPED. We only need to know we won't be boxed in --
+    # the penalty below fires when reachable space drops under our own length.
+    # Counting the whole 41x41 board (1681 cells) at every leaf was the search's
+    # dominant cost; capping at a small multiple of our length lets BFS stop
+    # early in open space (where the exact count doesn't change the decision).
+    space_cap = min(cells, max(2 * me.length, 32))
+    space = flood_fill(me.head, blocked, size, space_cap)
     score = 0.0
-    score += me.length * 1000.0          # length is the literal scoreboard
-    score += space * 10.0                # don't get boxed in
+    score += me.length * W_LENGTH        # growth is a nudge, not the goal
+    score += space * W_SPACE             # keep room to manoeuvre
     # If we can't even reach as many cells as our own length, we're trapped.
     if space < me.length:
-        score -= (me.length - space) * 200.0
+        score -= (me.length - space) * W_TRAP
 
-    # Seek apples by *path* distance. Weighted strongly enough that closing the
-    # distance beats coasting straight, but below the +1000 of eating (via the
-    # length term once the head reaches the apple in a child state).
+    # Seek apples by cheap torus (x/y) distance -- a linear scan over the apple
+    # set, no per-leaf obstacle-aware BFS. Only a faint pull now: eating grows us
+    # (less room, more trap risk), which our survival doctrine mostly dislikes.
     if state.apples:
-        if apple_dist is not None:
-            score -= apple_dist * 30.0
-        else:
-            # No free path to any apple right now (bodies in the way): keep a
-            # weaker straight-line pull plus a penalty for being walled off.
-            nearest = min(torus_dist(me.head, a, size) for a in state.apples)
-            score -= nearest * 30.0 + 80.0
+        nearest = min(torus_dist(me.head, a, size) for a in state.apples)
+        score -= nearest * W_APPLE
 
-    
     if state.bad_apples:
         # Avoid bad apples.
         for bad in state.bad_apples:
             d = torus_dist(me.head, bad, size)
-
             if d == 0:
-                score -= 1500
+                score -= W_BADAPPLE_ON
             else:
-                score -= 100.0 / d
+                score -= W_BADAPPLE_NEAR / d
 
-    # Mild bonus for outliving opponents.
+    # Outlive the field: every living opponent is a big standing penalty, so any
+    # line where a rival is forced to die is strongly preferred.
     opponents_alive = sum(
         1 for n, s in state.snakes.items() if n != state.me and s.alive
     )
-    score -= opponents_alive * 50.0
+    score -= opponents_alive * W_OPP_ALIVE
 
-    # Avoid sitting adjacent to a longer/equal enemy head (head-to-head risk).
+    # Aggression: reward sitting next to a living enemy head (pressure / kill
+    # threat). Actually moving INTO a head is still our own death (handled above,
+    # and it dominates), so this rewards adjacency only -- never suicide.
     for n, s in state.snakes.items():
         if n == state.me or not s.alive:
             continue
-        if torus_dist(me.head, s.head, size) == 1 and s.length >= me.length:
-            score -= 120.0
+        if torus_dist(me.head, s.head, size) == 1:
+            score += W_H2H
 
     return score
 
@@ -328,6 +383,8 @@ class SearchResult:
     score: float
     depth: int
     completed: bool
+    nodes: int = 0      # game-tree nodes expanded (search cost this tick)
+    elapsed_ms: float = 0.0  # wall time spent inside choose_direction
 
 
 # Only branch on opponents whose head is within this many cells of ours: a
@@ -363,9 +420,10 @@ def _opponent_joint_moves(state: SimState, opponents: List[str], deltas):
 
 
 def _search(state: SimState, depth: int, alpha: float, beta: float,
-            deadline: float, deltas, opp_k: int) -> float:
+            deadline: float, deltas, opp_k: int, stats: Dict[str, int]) -> float:
     if time.monotonic() > deadline:
         raise TimeUp
+    stats["nodes"] += 1
     me = state.snakes[state.me]
     if not me.alive or len(state.alive_names()) <= 1 or depth == 0:
         return evaluate(state, depth)
@@ -381,7 +439,7 @@ def _search(state: SimState, depth: int, alpha: float, beta: float,
             moves = dict(opp_moves)
             moves[state.me] = my_move
             child = simulate(state, moves, deltas)
-            val = _search(child, depth - 1, alpha, beta, deadline, deltas, opp_k)
+            val = _search(child, depth - 1, alpha, beta, deadline, deltas, opp_k, stats)
             if val < worst:
                 worst = val
             if worst <= alpha:
@@ -404,8 +462,19 @@ def choose_direction(state: SimState, deadline: float, deltas,
     called every time a deeper, completed search yields a (possibly new) best
     move, so the caller can post it immediately.
     """
+    search_start = time.monotonic()
+    stats: Dict[str, int] = {"nodes": 0}
     me = state.snakes[state.me]
     moves = legal_moves(me, deltas, state.size)
+
+    # HARD safety gate: if any move lands on a guaranteed-safe cell, restrict the
+    # whole search (and thus the move we POST) to those. This is what stops us
+    # ever reversing into our own neck when the calibrated compass briefly lags.
+    # Only when *every* direction looks deadly do we keep the full set and let the
+    # search pick the least-bad line.
+    safe = safe_moves(state, deltas)
+    if safe:
+        moves = safe
 
     # Move ordering = the tie-break (the search keeps the first move on equal
     # scores). Commit to ONE target apple -- the deterministically-nearest one --
@@ -466,7 +535,7 @@ def choose_direction(state: SimState, deadline: float, deltas,
                         mv[state.me] = my_move
                         child = simulate(state, mv, deltas)
                         val = _search(child, depth - 1, alpha, INF,
-                                      deadline, deltas, opp_k)
+                                      deadline, deltas, opp_k, stats)
                         worst = min(worst, val)
                         if worst <= alpha:
                             break
@@ -474,7 +543,7 @@ def choose_direction(state: SimState, deadline: float, deltas,
                 else:
                     child = simulate(state, {state.me: my_move}, deltas)
                     val = _search(child, depth - 1, alpha, INF,
-                                  deadline, deltas, opp_k)
+                                  deadline, deltas, opp_k, stats)
                 if val > depth_best_score:
                     depth_best_score = val
                     depth_best_dir = my_move
@@ -489,7 +558,9 @@ def choose_direction(state: SimState, deadline: float, deltas,
         if best_score <= -1e8:
             break
 
-    return SearchResult(best_dir, best_score, best_depth, completed=True)
+    elapsed_ms = (time.monotonic() - search_start) * 1000.0
+    return SearchResult(best_dir, best_score, best_depth, completed=True,
+                        nodes=stats["nodes"], elapsed_ms=elapsed_ms)
 
 
 # --------------------------------------------------------------------------- #
